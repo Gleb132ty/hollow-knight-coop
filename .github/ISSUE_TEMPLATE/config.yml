@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Скачать последнюю сборку
+    url: https://github.com/Gleb132ty/hollow-knight-coop/releases
+    about: Готовые архивы мода и исходников лежат в Releases.
