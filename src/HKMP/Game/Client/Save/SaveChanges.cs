@@ -1,0 +1,766 @@
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using Hkmp.Game.Settings;
+using Hkmp.Ui;
+using Hkmp.Util;
+using HutongGames.PlayMaker.Actions;
+using Modding;
+using UnityEngine;
+using Logger = Hkmp.Logging.Logger;
+
+namespace Hkmp.Game.Client.Save;
+
+/// <summary>
+/// Class that handles incoming save changes that have an immediate effect in the current scene for the local player.
+/// E.g. breakable walls that also break in another scene, tollgates that are being paid, stag station being bought.
+/// </summary>
+internal class SaveChanges {
+    /// <summary>
+    /// Prefixes of PlayerData entries that change the stock of a shop. When such an entry changes, any shop that
+    /// is currently open in the scene is refreshed, so the local player sees the updated stock immediately.
+    /// </summary>
+    private static readonly string[] ShopStockVarPrefixes = [
+        "soldCharm_", "boughtCharm_", "gotCharm_", "soldTrinket_", "salubra", "sly", "legEater",
+        "charmSlots", "hasCharm", "metSlyShop", "metRelicDealerShop", "jinnEggsSold", "tukEggPrice",
+        "openedSlyShop", "openedMapperShop"
+    ];
+
+    /// <summary>
+    /// The mod settings instance, used to check whether arena progress should be applied to the current scene.
+    /// </summary>
+    private readonly ModSettings _modSettings;
+
+    /// <summary>
+    /// Arena progress entries that were already announced in the chat, so that a repeated save update for the same
+    /// entry does not spam the chat.
+    /// </summary>
+    private readonly HashSet<string> _announcedArenaProgress = [];
+
+    public SaveChanges(ModSettings modSettings) {
+        _modSettings = modSettings;
+    }
+    /// <summary>
+    /// The names of the player data entries that denote an ability of the player. These are synchronised from the
+    /// server, so whenever one of them changes, the locally derived gating flags need to be updated as well.
+    /// </summary>
+    private static readonly string[] AbilityVarNames = [
+        "hasDash", "hasWalljump", "hasSuperDash", "hasShadowDash", "hasDoubleJump",
+        "hasAcidArmour", "hasLantern", "hasDreamNail", "dreamNailUpgraded", "hasDreamGate",
+        "hasSpell", "fireballLevel", "quakeLevel", "screamLevel",
+        "hasNailArt", "hasDashSlash", "hasUpwardSlash", "hasCyclone", "hasAllNailArts"
+    ];
+
+    /// <summary>
+    /// Synchronise the ability gating flags ('can*') of the local player data with the ability flags ('has*').
+    /// The game checks the 'canDash' flag before accepting dash input, so without this a player without the Mothwing
+    /// Cloak would still be able to dash (or a player that was granted the cloak would not be able to use it), since
+    /// the ability flags are synchronised from the server while the gating flags are not.
+    /// </summary>
+    public static void ReconcileAbilityFlags() {
+        var playerData = PlayerData.instance;
+        if (playerData == null) {
+            return;
+        }
+
+        playerData.SetBool("canDash", playerData.GetBool("hasDash"));
+        playerData.SetBool("canWallJump", playerData.GetBool("hasWalljump"));
+        playerData.SetBool("canSuperDash", playerData.GetBool("hasSuperDash"));
+        playerData.SetBool("canShadowDash", playerData.GetBool("hasShadowDash"));
+    }
+
+    /// <summary>
+    /// Whether the given player data entry is one of the ability entries that require the gating flags to be
+    /// synchronised.
+    /// </summary>
+    /// <param name="name">The name of the player data entry.</param>
+    /// <returns>true if the entry denotes an ability, false otherwise.</returns>
+    public static bool IsAbilityVar(string name) {
+        return AbilityVarNames.Contains(name);
+    }
+
+    /// <summary>
+    /// Apply a change in player data from a save update for the given name immediately. This checks whether
+    /// the local player is in a scene where the changes in player data have an effect on the environment.
+    /// For example, a breakable wall that also opens up in another scene or a stag station being bought.
+    /// </summary>
+    /// <param name="name">The name of the PlayerData entry.</param>
+    public void ApplyPlayerDataSaveChange(string name) {
+        Logger.Debug($"ApplyPlayerData for name: {name}");
+
+        // If we receive an ability from a save update, we need to also update the 'can*' booleans to ensure that the
+        // input for the ability is (not) accepted, matching the synchronised ability state
+        if (IsAbilityVar(name)) {
+            ReconcileAbilityFlags();
+            return;
+        }
+
+        // Economy: keep an open shop in sync with purchases and unlocks from teammates
+        if (RefreshOpenShopStock(name)) {
+            return;
+        }
+
+        // Arenas: keep Godhome boss doors in sync with pantheon progress from teammates
+        if (_modSettings.ArenaSync && RefreshArenaProgress(name)) {
+            return;
+        }
+        
+        var currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        
+        if (name == "crossroadsMawlekWall" && currentScene == "Crossroads_33") {
+            GameObject breakWall = null;
+            PlayMakerFSM breakWallFsm = null;
+            PlayMakerFSM fullWallFsm = null;
+
+            var found = 0;
+            
+            var fsms = Object.FindObjectsOfType<PlayMakerFSM>(true);
+            foreach (var fsm in fsms) {
+                if (fsm.Fsm.Name.Equals("playerdata_activation")) {
+                    if (fsm.name.Equals("break_wall_left")) {
+                        breakWall = fsm.gameObject;
+                        breakWallFsm = fsm;
+
+                        found++;
+                        if (found == 2) {
+                            break;
+                        }
+                    } else if (fsm.name.Equals("full_wall_left")) {
+                        fullWallFsm = fsm;
+
+                        found++;
+                        if (found == 2) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (found < 2) {
+                Logger.Error("Could not find breakable wall objects for 'crossroadsMawlekWall' player data change");
+                return;
+            }
+
+            // Activate the breakWall object and set variable and state in the FSM
+            breakWall!.SetActive(true);
+            breakWallFsm.FsmVariables.GetFsmBool("Activate").Value = true;
+            breakWallFsm.SetState("Check Activation");
+            
+            // Disable the full wall
+            fullWallFsm!.SetState("Check Activation");
+            return;
+        }
+
+        if (name == "dungDefenderWallBroken" && currentScene == "Abyss_01") {
+            GameObject wall = null;
+            GameObject wallBroken = null;
+
+            var found = 0;
+
+            var fsms = Object.FindObjectsOfType<PlayMakerFSM>(true);
+            foreach (var fsm in fsms) {
+                if (fsm.name.Equals("dung_defender_wall")) {
+                    wall = fsm.gameObject;
+
+                    found++;
+                    if (found == 2) {
+                        break;
+                    }
+                } else if (fsm.name.Equals("dung_defender_wall_broken")) {
+                    wallBroken = fsm.gameObject;
+
+                    found++;
+                    if (found == 2) {
+                        break;
+                    }
+                }
+            }
+            
+            if (found < 2) {
+                Logger.Error("Could not find breakable wall objects for 'dungDefenderWallBroken' player data change");
+                return;
+            }
+
+            wall!.SetActive(false);
+            wallBroken!.SetActive(true);
+            return;
+        }
+
+        if (
+            name == "openedCrossroads" && currentScene == "Crossroads_47" || 
+            name == "openedGreenpath" && currentScene == "Fungus1_16_alt" ||
+            name == "openedFungalWastes" && currentScene == "Fungus2_02" ||
+            name == "openedRuins1" && currentScene == "Ruins1_29" ||
+            name == "openedRuins2" && currentScene == "Ruins2_08" ||
+            name == "openedDeepnest" && currentScene == "Deepnest_09" ||
+            name == "openedRoyalGardens" && currentScene == "Fungus3_40" ||
+            name == "openedHiddenStation" && currentScene == "Abyss_22"
+        ) {
+            var go = GameObject.Find("Station Bell");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Stag Bell");
+            if (fsm == null) {
+                return;
+            }
+
+            // Add additional actions from different states to ensure the player gets control back if they are already
+            // in the FSM flow
+            if (IsInTollMachineDialogue(fsm.Fsm.ActiveStateName)) {
+                var action1 = fsm.GetFirstAction<CallMethodProper>("Yes");
+                fsm.InsertAction("Box Disappear Anim", action1, 0);
+                var action2 = fsm.GetFirstAction<Tk2dPlayAnimationWithEvents>("Yes");
+                action2.animationCompleteEvent = null;
+                fsm.InsertAction("Box Disappear Anim", action2, 0);
+                var action3 = fsm.GetFirstAction<SendEventByName>("Yes");
+                fsm.InsertAction("Box Disappear Anim", action3, 0);
+                var action4 = fsm.GetFirstAction<CallMethodProper>("Pause Before Box Drop");
+                fsm.InsertAction("Box Disappear Anim", action4, 0);
+                var action5 = fsm.GetFirstAction<SetPlayerDataBool>("Pause Before Box Drop");
+                fsm.InsertAction("Box Disappear Anim", action5, 0);
+                var action6 = fsm.GetAction<CallMethodProper>("Pause Before Box Drop", 2);
+                fsm.InsertAction("Box Disappear Anim", action6, 0);
+
+                HideDialogueBox();
+            }
+
+            fsm.SetState("Box Disappear Anim");
+            return;
+        }
+
+        if (
+            name == "tollBenchCity" && currentScene == "Ruins1_31" ||
+            name == "tollBenchAbyss" && currentScene == "Abyss_18" ||
+            name == "tollBenchQueensGardens" && currentScene == "Fungus3_50"
+        ) {
+            var go = GameObject.Find("Toll Machine Bench");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Toll Machine Bench");
+            if (fsm == null) {
+                return;
+            }
+
+            // Add additional actions from different states to ensure the player gets control back if they are already
+            // in the FSM flow
+            if (IsInTollMachineDialogue(fsm.Fsm.ActiveStateName)) {
+                var action1 = fsm.GetFirstAction<Tk2dPlayAnimationWithEvents>("Yes");
+                action1.animationCompleteEvent = null;
+                fsm.InsertAction("Box Down", action1, 0);
+                var action2 = fsm.GetFirstAction<SendEventByName>("Yes");
+                fsm.InsertAction("Box Down", action2, 0);
+                var action3 = fsm.GetFirstAction<CallMethodProper>("Pause Before Box Drop");
+                fsm.InsertAction("Box Down", action3, 0);
+                var action4 = fsm.GetFirstAction<SetPlayerDataBool>("Pause Before Box Drop");
+                fsm.InsertAction("Box Down", action4, 0);
+                var action5 = fsm.GetAction<CallMethodProper>("Pause Before Box Drop", 3);
+                fsm.InsertAction("Box Down", action5, 0);
+
+                HideDialogueBox();
+            }
+
+            fsm.SetState("Box Down");
+            return;
+        }
+
+        if (name == "openedRestingGrounds02" && currentScene == "RestingGrounds_02") {
+            var go = GameObject.Find("Bottom Gate Collider");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("FSM");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Destroy");
+            return;
+        }
+
+        if (name == "waterwaysGate" && currentScene == "Fungus2_23") {
+            var go = GameObject.Find("Waterways Gate");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Gate Control");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Destroy");
+            return;
+        }
+
+        if (name == "deepnestWall") {
+            GameObject go = null;
+            if (currentScene == "Deepnest_01") {
+                go = GameObject.Find("Breakable Wall");
+            } else if (currentScene == "Fungus2_20") {
+                go = GameObject.Find("Breakable Wall Waterways");
+            }
+
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("breakable_wall_v2");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Pause Frame");
+            return;
+        }
+
+        if (name == "oneWayArchive" && currentScene == "Fungus3_02") {
+            var go = GameObject.Find("One Way Wall Exit");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("FSM");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Destroy");
+            return;
+        }
+
+        if (name == "openedGardensStagStation" && currentScene == "Fungus3_13") {
+            var go = GameObject.Find("royal_garden_slide_door");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("FSM");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Destroy");
+            return;
+        }
+
+        if (name == "openedCityGate" && currentScene == "Fungus2_21") {
+            var go = GameObject.Find("City Gate Control");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Conversation Control");
+            if (fsm == null) {
+                return;
+            }
+            
+            string[] inDialogueStateNames = [
+                "Hero Anim", "Key?", "Box Up YN", "Send Text", "Box Up", "No Key"
+            ];
+            if (inDialogueStateNames.Contains(fsm.Fsm.ActiveStateName)) {
+                var action1 = fsm.GetFirstAction<SendEventByName>("Yes");
+                fsm.InsertAction("Activate", action1, 0);
+                
+                HideDialogueBox();
+            }
+            
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Activate");
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Activate");
+
+            fsm.SetState("Activate");
+            return;
+        }
+
+        if (name == "openedWaterwaysManhole" && currentScene == "Ruins1_05b") {
+            var go = GameObject.Find("Waterways Machine");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Conversation Control");
+            if (fsm == null) {
+                return;
+            }
+
+            string[] inDialogueStateNames = [
+                "Hero Anim", "Key?", "Box Up YN", "Send Text", "Box Up", "No Key"
+            ];
+            if (inDialogueStateNames.Contains(fsm.Fsm.ActiveStateName)) {
+                var action1 = fsm.GetFirstAction<SendEventByName>("Yes");
+                fsm.InsertAction("Activate", action1, 0);
+                
+                HideDialogueBox();
+            }
+
+            fsm.RemoveFirstAction<SetPlayerDataInt>("Activate");
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Activate");
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Activate");
+            
+            fsm.SetState("Activate");
+            return;
+        }
+
+        if (name == "xunFlowerGiven" && currentScene == "Fungus3_49") {
+            var go = GameObject.Find("Inspect Region");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Conversation Control");
+            if (fsm == null) {
+                return;
+            }
+
+            // Remove a bunch of actions that only apply to the placing player
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Flowers");
+            fsm.RemoveFirstAction<Tk2dPlayAnimationWithEvents>("Ghost Appear");
+            fsm.RemoveFirstAction<FaceObject>("Ghost Appear");
+            fsm.RemoveFirstAction<Tk2dPlayAnimation>("Look Up");
+            fsm.RemoveFirstAction<Tk2dPlayAnimation>("Get Up");
+
+            fsm.SetState("Glow");
+            return;
+        }
+        
+        if (name == "openedMageDoor_v2" && currentScene == "Ruins1_31") {
+            var go = GameObject.Find("Mage Door");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Conversation Control");
+            if (fsm == null) {
+                return;
+            }
+            
+            string[] inDialogueStateNames = [
+                "Hero Anim", "Check Key", "Box Up YN", "Send Text", "Box Up", "No Key"
+            ];
+            if (inDialogueStateNames.Contains(fsm.Fsm.ActiveStateName)) {
+                HideDialogueBox();
+            } else {
+                fsm.RemoveFirstAction<Tk2dPlayAnimationWithEvents>("Yes");
+            }
+            
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Yes");
+
+            fsm.SetState("Yes");
+            return;
+        }
+
+        if (name == "cityLift1" && currentScene == "Crossroads_49b") {
+            var go = GameObject.Find("Toll Machine Lift");
+            var fsm = go.LocateMyFSM("Toll Machine");
+
+            // Hide the dialogue box if the local player is in the dialogue flow
+            if (IsInTollMachineDialogue(fsm.Fsm.ActiveStateName)) {
+                HideDialogueBox();
+            }
+            
+            fsm.RemoveFirstAction<SetPlayerDataBool>("Send Message");
+
+            fsm.SetState("Yes");
+            return;
+        }
+        
+        if (name == "nightmareLanternAppeared" && currentScene == "Cliffs_06") {
+            var go = GameObject.Find("Sycophant Dream");
+            var fsm = go.LocateMyFSM("Activate Lantern");
+            
+                        fsm.SetState("Impact");
+        }
+    }
+
+    /// <summary>
+    /// Apply a change in persistent values from a save update for the given name immediately. This checks whether
+    /// the local player is in a scene where the changes in player data have an effect on the environment.
+    /// For example, a breakable wall that also opens up in another scene or a stag station being bought.
+    /// </summary>
+    /// <param name="itemKey">The persistent item key containing the ID and scene name of the changed object.</param>
+    public void ApplyPersistentValueSaveChange(PersistentItemKey itemKey) {
+        Logger.Debug($"ApplyPersistent for item data: {itemKey}");
+
+        var currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        
+        if (
+            itemKey.Id.StartsWith("Toll Gate Machine") && ( 
+            itemKey.SceneName == "Mines_33" && currentScene == "Mines_33" ||
+            itemKey.SceneName == "Fungus1_31" && currentScene == "Fungus1_31"
+        )) {
+            var go = GameObject.Find("Toll Gate Machine");
+            var fsm = go.LocateMyFSM("Toll Machine");
+
+            // Add additional actions from different states to ensure the player gets control back if they are already
+            // in the FSM flow
+            if (IsInTollMachineDialogue(fsm.Fsm.ActiveStateName)) {
+                var action1 = fsm.GetFirstAction<Tk2dPlayAnimationWithEvents>("Yes");
+                action1.animationCompleteEvent = null;
+                fsm.InsertAction("Box Disappear Anim", action1, 0);
+                var action2 = fsm.GetFirstAction<SendEventByName>("Yes");
+                fsm.InsertAction("Box Disappear Anim", action2, 0);
+                var action3 = fsm.GetFirstAction<CallMethodProper>("Pause Before Box Drop");
+                fsm.InsertAction("Box Disappear Anim", action3, 0);
+                var action4 = fsm.GetFirstAction<SetPlayerDataBool>("Pause Before Box Drop");
+                fsm.InsertAction("Box Disappear Anim", action4, 0);
+                var action5 = fsm.GetAction<CallMethodProper>("Pause Before Box Drop", 2);
+                fsm.InsertAction("Box Disappear Anim", action5, 0);
+
+                HideDialogueBox();
+            }
+
+            fsm.RemoveFirstAction<SetBoolValue>("Open Gates");
+
+            fsm.SetState("Box Disappear Anim");
+            return;
+        }
+        
+        if (itemKey.Id == "Collapser Tute 01" && itemKey.SceneName == "Tutorial_01" && currentScene == "Tutorial_01") {
+            var go = GameObject.Find("Collapser Tute 01");
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("collapse tute");
+            fsm.RemoveFirstAction<SendMessage>("Force Hard Landing");
+            fsm.SetState("Crumble");
+            return;
+        }
+
+        if (itemKey.Id.StartsWith("Collapser Small") && itemKey.SceneName == currentScene) {
+            var go = GameObject.Find(itemKey.Id);
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("collapse small");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Split");
+            return;
+        }
+
+        if (itemKey.Id.StartsWith("Quake Floor") && itemKey.SceneName == currentScene) {
+            var go = GameObject.Find(itemKey.Id);
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("quake_floor");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Audio");
+        }
+
+        if (itemKey.Id == "Bone Gate" && itemKey.SceneName == currentScene) {
+            var go = GameObject.Find(itemKey.Id);
+            if (go == null) {
+                return;
+            }
+
+            var fsm = go.LocateMyFSM("Bone Gate");
+            if (fsm == null) {
+                return;
+            }
+
+            fsm.SetState("Open Audio");
+        }
+    }
+
+    /// <summary>
+    /// Refresh any shop that is currently open in the scene when a purchase or shop unlock changed. Since
+    /// purchases are player-specific, this mainly covers shared shop unlocks and charm slot changes, but it also
+    /// keeps the displayed stock correct when a teammate's change arrives while the local shop menu is open.
+    /// </summary>
+    /// <param name="name">The name of the PlayerData entry that changed.</param>
+    /// <returns>true if the entry belongs to a shop, false otherwise.</returns>
+    private bool RefreshOpenShopStock(string name) {
+        if (!ShopStockVarPrefixes.Any(prefix => name.StartsWith(prefix))) {
+            return false;
+        }
+
+        var refreshed = 0;
+
+        foreach (var stock in Object.FindObjectsOfType<ShopMenuStock>(true)) {
+            try {
+                stock.UpdateStock();
+                refreshed++;
+            } catch (System.Exception e) {
+                Logger.Warn($"Could not refresh shop stock after change of '{name}': {e.Message}");
+            }
+        }
+
+        if (refreshed > 0) {
+            Logger.Info($"Refreshed stock of {refreshed} shop(s) after change of '{name}'");
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Announce in the chat that a teammate completed a Colosseum trial or a Pantheon. This is only called for save
+    /// updates that arrive from teammates, so the progress of the local player is not announced.
+    /// </summary>
+    /// <param name="name">The name of the PlayerData entry that changed.</param>
+    public void NotifyArenaProgress(string name) {
+        if (PlayerData.instance == null || UiManager.InternalChatBox == null) {
+            return;
+        }
+
+        string message = null;
+
+        if (name.StartsWith("colosseum") && name.EndsWith("Completed")) {
+            if (!PlayerData.instance.GetBool(name)) {
+                _announcedArenaProgress.Remove(name);
+                return;
+            }
+
+            message = name switch {
+                "colosseumBronzeCompleted" => Localization.Get("A teammate completed the Trial of the Warrior"),
+                "colosseumSilverCompleted" => Localization.Get("A teammate completed the Trial of the Conqueror"),
+                "colosseumGoldCompleted" => Localization.Get("A teammate completed the Trial of the Fool"),
+                _ => null
+            };
+        } else if (name.StartsWith("bossDoorStateTier")) {
+            var completion = PlayerData.instance.GetVariableInternal<BossSequenceDoor.Completion>(name);
+            if (!completion.completed) {
+                _announcedArenaProgress.Remove(name);
+                return;
+            }
+
+            message = name switch {
+                "bossDoorStateTier1" => Localization.Get("A teammate completed the Pantheon of the Master"),
+                "bossDoorStateTier2" => Localization.Get("A teammate completed the Pantheon of the Artist"),
+                "bossDoorStateTier3" => Localization.Get("A teammate completed the Pantheon of the Sage"),
+                "bossDoorStateTier4" => Localization.Get("A teammate completed the Pantheon of the Knight"),
+                "bossDoorStateTier5" => Localization.Get("A teammate completed the Pantheon of Hallownest"),
+                _ => null
+            };
+        }
+
+        if (message == null || !_announcedArenaProgress.Add(name)) {
+            return;
+        }
+
+        UiManager.InternalChatBox.AddMessage(message);
+        Logger.Info($"Announced arena progress from a teammate: {name}");
+    }
+
+    /// <summary>
+    /// Apply arena progress from a save update to the current scene. Godhome boss doors cache their completion
+    /// when the scene loads, so without this a teammate unlocking a pantheon would only see the door open after
+    /// leaving and re-entering Godhome.
+    /// </summary>
+    /// <param name="name">The name of the PlayerData entry that changed.</param>
+    /// <returns>true if the entry belongs to an arena, false otherwise.</returns>
+    private bool RefreshArenaProgress(string name) {
+        if (name.StartsWith("bossDoorStateTier")) {
+            RefreshBossDoors(name);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Update the display state of every boss sequence door in the scene that uses the given PlayerData entry.
+    /// </summary>
+    /// <param name="name">The name of the PlayerData entry containing the door completion.</param>
+    private void RefreshBossDoors(string name) {
+        var completion = PlayerData.instance.GetVariableInternal<BossSequenceDoor.Completion>(name);
+
+        var setDisplayState = typeof(BossSequenceDoor).GetMethod(
+            "SetDisplayState",
+            BindingFlags.Instance | BindingFlags.NonPublic
+        );
+
+        foreach (var door in Object.FindObjectsOfType<BossSequenceDoor>(true)) {
+            var playerDataString = ReflectionHelper.GetField<BossSequenceDoor, string>(door, "playerDataString");
+            if (playerDataString != name) {
+                continue;
+            }
+
+            door.CurrentCompletion = completion;
+
+            try {
+                setDisplayState?.Invoke(door, [completion]);
+            } catch (System.Exception e) {
+                Logger.Warn($"Could not refresh boss sequence door '{door.name}': {e.Message}");
+            }
+
+            Logger.Info($"Updated boss sequence door '{door.name}' for '{name}'");
+        }
+    }
+
+    /// <summary>
+    /// Whether the local player is currently in a toll machine dialogue prompt that has claimed control of the
+    /// character.
+    /// </summary>    /// <param name="currentStateName">The name of the current state of the dialogue FSM.</param>
+    /// <returns>true if the player is in dialogue, false otherwise.</returns>
+    private bool IsInTollMachineDialogue(string currentStateName) {
+        string[] outOfDialogueStateNames = [
+            "Out Of Range", "In Range", "Can Inspect?", "Cancel Frame", "Pause", "Activated?", "Paid?", "Get Price", "Init", 
+            "Regain Control"
+        ];
+
+        return !outOfDialogueStateNames.Contains(currentStateName);
+    }
+
+    /// <summary>
+    /// Hide the currently active dialogue box by setting the state of the 'Dialogue Page Control' FSM of the 'Text YN'
+    /// game object. Needs to be amended if this method should also hide dialogue boxes of other dialogue types.
+    /// </summary>
+    private void HideDialogueBox() {
+        var gc = GameCameras.instance;
+        if (gc == null) {
+            Logger.Warn("Could not find GameCameras instance");
+            return;
+        }
+
+        var hudCamera = gc.hudCamera;
+        if (hudCamera == null) {
+            Logger.Warn("Could not find hudCamera");
+            return;
+        }
+
+        var dialogManager = hudCamera.gameObject.FindGameObjectInChildren("DialogueManager");
+        if (dialogManager == null) {
+            Logger.Warn("Could not find dialogueManager");
+            return;
+        }
+
+        void HideDialogueObject(string objectName, string heroDmgState) {
+            var obj = dialogManager.FindGameObjectInChildren(objectName);
+            if (obj != null) {
+                var dialogueBox = obj.GetComponent<DialogueBox>();
+                if (dialogueBox == null) {
+                    Logger.Warn($"Could not find {objectName} DialogueBox");
+                    return;
+                }
+
+                var hidden = ReflectionHelper.GetField<DialogueBox, bool>(dialogueBox, "hidden");
+                if (hidden) {
+                    return;
+                }
+            
+                var pageControlFsm = obj.LocateMyFSM("Dialogue Page Control");
+                if (pageControlFsm == null) {
+                    Logger.Warn($"Could not find {objectName} DialoguePageControl FSM");
+                    return;
+                }
+                pageControlFsm.SetState(heroDmgState);
+            }
+        }
+        
+        HideDialogueObject("Text YN", "Hero Damaged");
+        HideDialogueObject("Text", "Pause");
+    }
+}
